@@ -821,7 +821,7 @@ internal data class CatalogUpdate(
 
 internal object RemoteChannelRepository {
     private const val CATEGORIES_URL =
-        "https://raw.githubusercontent.com/vinod-rajput-vg/My-India-TV/main/Categories/categories.txt"
+        "https://raw.githubusercontent.com/rohit-rajput-77/My-India-TV/refs/heads/main/Categories/categories.txt"
 
     // Keep interactive catalog requests isolated from the startup fingerprint scan.
     private val catalogExecutor = Executors.newFixedThreadPool(2)
