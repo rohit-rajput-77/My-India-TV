@@ -177,7 +177,6 @@ internal object ChannelIconLoader {
     private fun decodeSampled(source: java.io.InputStream): Bitmap? {
         // Decode from a byte array so the bounds pass and bitmap pass read the same
         // bytes. A fixed 64 KiB mark limit breaks on valid images larger than 64 KiB
-        // (including Movie Posters/Rambo_2.png).
         val bytes = source.use { it.readBytes() }
         if (bytes.isEmpty()) return null
 
