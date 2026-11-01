@@ -1,0 +1,986 @@
+package com.myindiatv
+
+import android.app.Activity
+import android.content.ActivityNotFoundException
+import android.content.Context
+import android.content.Intent
+import android.graphics.*
+import android.util.LruCache
+import android.net.Uri
+import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.view.KeyEvent
+import android.view.View
+import android.widget.Toast
+import java.io.BufferedInputStream
+import java.net.HttpURLConnection
+import java.net.URL
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Executors
+
+
+internal object ChannelIconLoader {
+    private val executor = Executors.newFixedThreadPool(4)
+    private val cache = object : LruCache<String, Bitmap>(12 * 1024 * 1024) {
+        override fun sizeOf(key: String, value: Bitmap): Int {
+            return value.byteCount
+        }
+    }
+    private const val CACHE_DIR = "channel_icons"
+
+    fun load(source: String, view: View, onLoaded: (Bitmap) -> Unit) {
+        val key = normalizeUrl(source)
+        if (key.isEmpty()) return
+
+        if (!key.startsWith("http://") && !key.startsWith("https://")) {
+            val resourceName = key.substringAfterLast("/").substringBeforeLast(".").lowercase()
+            val resourceId = view.resources.getIdentifier(resourceName, "drawable", view.context.packageName)
+            if (resourceId != 0) {
+                val bitmap = BitmapFactory.decodeResource(view.resources, resourceId)
+                if (bitmap != null) view.post { onLoaded(bitmap) }
+            }
+            return
+        }
+
+        cache[key]?.let { bitmap ->
+            view.post { onLoaded(bitmap) }
+            return
+        }
+
+        executor.execute {
+            val cachedBitmap = loadFromDisk(view.context, key)
+            if (cachedBitmap != null) {
+                cache.put(key, cachedBitmap)
+                view.post { onLoaded(cachedBitmap) }
+                return@execute
+            }
+
+            val bitmap = download(key)
+            if (bitmap != null) {
+                val cached = synchronized(cache) { cache.get(key) ?: bitmap.also { cache.put(key, it) } }
+                saveToDisk(view.context, key, cached)
+                view.post { onLoaded(cached) }
+            }
+        }
+    }
+
+    private val preloading = ConcurrentHashMap.newKeySet<String>()
+
+    /**
+     * Warm the in-memory and disk image caches in the background so channel logos are ready
+     * before a user opens a category. URLs already cached or being preloaded are skipped.
+     */
+    fun preloadAll(context: Context, sources: Collection<String>) {
+        val appContext = context.applicationContext
+        sources.forEach { source ->
+            val key = normalizeUrl(source)
+            if (!key.startsWith("http://") && !key.startsWith("https://")) return@forEach
+            if (cache.get(key) != null || !preloading.add(key)) return@forEach
+
+            executor.execute {
+                try {
+                    if (cache.get(key) != null) return@execute
+                    val bitmap = loadFromDisk(appContext, key) ?: download(key)
+                    if (bitmap != null) {
+                        val cached = synchronized(cache) { cache.get(key) ?: bitmap.also { cache.put(key, it) } }
+                        saveToDisk(appContext, key, cached)
+                    }
+                } finally {
+                    preloading.remove(key)
+                }
+            }
+        }
+    }
+
+    fun invalidateChanged(context: Context, changedPaths: Set<String>, candidateUrls: Collection<String>) {
+        val changedNames = changedPaths
+            .filter { it.startsWith("Category Icons/") || it.startsWith("Channel Icons/") }
+            .map { it.substringAfterLast('/').substringBefore('?').lowercase() }
+            .toSet()
+        if (changedNames.isEmpty()) return
+
+        val allKnownUrls = (candidateUrls + cache.snapshot().keys).map(::normalizeUrl).toSet()
+        allKnownUrls.forEach { url ->
+            if (url.isBlank()) return@forEach
+            val fileName = Uri.parse(url).lastPathSegment.orEmpty().substringBefore('?').lowercase()
+            if (fileName in changedNames) {
+                cache.remove(url)
+                try { cacheFile(context, url).delete() } catch (_: Exception) {}
+            }
+        }
+    }
+
+    /**
+     * Remove disk and memory image caches for deleted or changed channel entries.
+     * The current category view will download and save the replacement icon on refresh.
+     */
+    fun reconcileChannels(context: Context, previous: List<Channel>, updated: List<Channel>) {
+        val updatedByName = updated.associateBy { it.name.trim().lowercase() }
+        val urlsToInvalidate = linkedSetOf<String>()
+        previous.forEach { old ->
+            val replacement = updatedByName[old.name.trim().lowercase()]
+            if (replacement == null || replacement.streamUrl != old.streamUrl || replacement.iconUrl != old.iconUrl) {
+                if (old.iconUrl.isNotBlank()) urlsToInvalidate.add(normalizeUrl(old.iconUrl))
+            }
+        }
+        urlsToInvalidate.forEach { url ->
+            cache.remove(url)
+            try { cacheFile(context, url).delete() } catch (_: Exception) {}
+        }
+    }
+
+    private fun normalizeUrl(source: String): String {
+        val value = source.trim()
+        if (value.isEmpty()) return ""
+        if (!value.startsWith("http://", ignoreCase = true) && !value.startsWith("https://", ignoreCase = true)) return value
+        return value.replace(" ", "%20")
+    }
+
+    private fun cacheFile(context: Context, url: String): java.io.File {
+        val directory = java.io.File(context.filesDir, CACHE_DIR)
+        if (!directory.exists()) directory.mkdirs()
+        return java.io.File(directory, hashUrl(url) + ".png")
+    }
+
+    private fun hashUrl(url: String): String {
+        val digest = java.security.MessageDigest.getInstance("SHA-256")
+        return digest.digest(url.toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it) }
+    }
+
+    private fun loadFromDisk(context: Context, url: String): Bitmap? {
+        val file = cacheFile(context, url)
+        if (!file.exists() || file.length() == 0L) return null
+        return try {
+            java.io.FileInputStream(file).use { input -> decodeSampled(input) }
+        } catch (_: Exception) {
+            try { file.delete() } catch (_: Exception) {}
+            null
+        }
+    }
+
+    private fun saveToDisk(context: Context, url: String, bitmap: Bitmap) {
+        val file = cacheFile(context, url)
+        if (file.exists() && file.length() > 0L) return
+        val tempFile = java.io.File(file.parentFile, file.name + ".tmp")
+        try {
+            java.io.FileOutputStream(tempFile).use { output ->
+                bitmap.compress(Bitmap.CompressFormat.PNG, 100, output)
+                output.flush()
+            }
+            if (!tempFile.renameTo(file)) tempFile.delete()
+        } catch (_: Exception) {
+            tempFile.delete()
+        }
+    }
+
+    private fun decodeSampled(source: java.io.InputStream): Bitmap? {
+        // Decode from a byte array so the bounds pass and bitmap pass read the same
+        // bytes. A fixed 64 KiB mark limit breaks on valid images larger than 64 KiB
+        // (including Movie Posters/Rambo_2.png).
+        val bytes = source.use { it.readBytes() }
+        if (bytes.isEmpty()) return null
+
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
+
+        val maxWidth = 512
+        val maxHeight = 384
+        var sampleSize = 1
+        while (bounds.outWidth / sampleSize > maxWidth * 2 || bounds.outHeight / sampleSize > maxHeight * 2) {
+            sampleSize *= 2
+        }
+        val options = BitmapFactory.Options().apply {
+            inSampleSize = sampleSize
+            inPreferredConfig = Bitmap.Config.ARGB_8888
+        }
+        return BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options)
+    }
+    private fun download(url: String): Bitmap? {
+        var connection: HttpURLConnection? = null
+        return try {
+            connection = URL(url).openConnection() as HttpURLConnection
+            connection.connectTimeout = 10_000
+            connection.readTimeout = 15_000
+            connection.instanceFollowRedirects = true
+            connection.useCaches = true
+            connection.setRequestProperty("User-Agent", "My-India-TV/1.0")
+            connection.setRequestProperty("Accept", "image/avif,image/webp,image/apng,image/png,image/jpeg,image/*,*/*;q=0.8")
+            connection.connect()
+            if (connection.responseCode !in 200..299) return null
+            BufferedInputStream(connection.inputStream).use { input -> decodeSampled(input) }
+        } catch (_: Exception) {
+            null
+        } finally {
+            connection?.disconnect()
+        }
+    }
+}
+class MainActivity : Activity() {
+    private lateinit var homeView: HomeView
+    private var channelView: ChannelView? = null
+    private var activeCategory: Category? = null
+    private var categories: List<Category> = emptyList()
+    /**
+     * Check the remote catalog once on each app launch. There is no timed polling
+     * interval; the next check happens when the app is restarted.
+     */
+    private fun checkCatalogOnStartup() {
+        RemoteChannelRepository.scanForChanges(this) { update ->
+            if (isFinishing || isDestroyed || update == null) return@scanForChanges
+
+            if (update.categoriesChanged) {
+                categories = update.categories
+                homeView.setCategories(categories)
+            }
+
+            update.changedCategoryNames.forEach { changedName ->
+                val active = activeCategory
+                val view = channelView
+                if (active != null && view != null &&
+                    active.name.equals(changedName, ignoreCase = true)
+                ) {
+                    val refreshedCategory = categories.firstOrNull {
+                        it.name.equals(changedName, ignoreCase = true)
+                    }
+                    if (refreshedCategory != null) {
+                        activeCategory = refreshedCategory
+                        refreshCategory(refreshedCategory, view)
+                    }
+                }
+            }
+        }
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_FULLSCREEN or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+        homeView = HomeView(this, emptyList())
+        setContentView(homeView)
+        homeView.requestFocus()
+        RemoteChannelRepository.loadCategories(this) { loaded ->
+            // Keep the exact order from Categories/categories.txt; do not alphabetize.
+            categories = loaded.toList()
+            homeView.setCategories(categories)
+            if (loaded.isEmpty()) Toast.makeText(this, "Unable to load categories. Check your internet connection.", Toast.LENGTH_LONG).show()
+            checkCatalogOnStartup()
+        }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+    }
+
+    fun openCategory(index: Int) {
+        val category = categories.getOrNull(index) ?: return
+        val view = ChannelView(this, emptyList())
+        channelView = view
+        activeCategory = category
+        setContentView(view)
+        view.requestFocus()
+        refreshCategory(category, view)
+    }
+
+    private fun refreshCategory(category: Category, view: ChannelView) {
+        RemoteChannelRepository.loadChannels(this, category) { channels ->
+            if (channelView !== view || activeCategory != category) return@loadChannels
+            // Remove only stale icon cache entries belonging to changed/removed channels.
+            ChannelIconLoader.reconcileChannels(this, view.currentChannels(), channels)
+            // Keep the exact order from this category's Category Channels/*.txt file.
+            view.replaceChannels(channels.toList())
+        }
+    }
+
+    fun showHome() {
+        activeCategory = null
+        channelView = null
+        setContentView(homeView)
+        homeView.requestFocus()
+        homeView.postInvalidateOnAnimation()
+    }
+
+    fun openStream(url: String) {
+        val streamUrl = url.trim()
+        if (streamUrl.isEmpty()) { Toast.makeText(this, "Stream unavailable", Toast.LENGTH_SHORT).show(); return }
+        val uri = Uri.parse(streamUrl)
+        if (uri.scheme?.lowercase() !in setOf("https", "http") || uri.host.isNullOrBlank() || uri.userInfo != null) {
+            Toast.makeText(this, "Invalid stream URL", Toast.LENGTH_SHORT).show(); return
+        }
+        try {
+            startActivity(Intent(Intent.ACTION_VIEW, uri))
+        } catch (_: ActivityNotFoundException) {
+            Toast.makeText(this, "No compatible player installed", Toast.LENGTH_SHORT).show()
+        } catch (_: SecurityException) {
+            Toast.makeText(this, "Unable to open stream", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        if (event.action == KeyEvent.ACTION_DOWN) {
+            if (channelView?.handleDpadKey(event.keyCode) == true) return true
+            if (::homeView.isInitialized && channelView == null && homeView.handleDpadKey(event.keyCode)) return true
+        }
+        return super.dispatchKeyEvent(event)
+    }
+}
+
+private class HomeView(context: Context, initialCategories: List<Category>) : View(context) {
+    private var categories: List<Category> = initialCategories
+    private var names: List<String> = initialCategories.map { it.name }
+    private val title = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.WHITE; typeface = Typeface.DEFAULT_BOLD }
+    private val iconPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { isFilterBitmap = true; isAntiAlias = true }
+    private val selectionPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE; color = Color.WHITE; isAntiAlias = true }
+    private var bitmaps = arrayOfNulls<Bitmap>(categories.size)
+    private val columns = 5
+    private var selected = 0
+    private var scrollOffset = 0f
+    private var lastTouchY = 0f
+    private var touchDragging = false
+    private var lastBackPressTime = 0L
+
+    init {
+        isFocusable = true
+        isFocusableInTouchMode = true
+        requestFocus()
+        loadCategoryIcons()
+    }
+
+    fun setCategories(updated: List<Category>) {
+        categories = updated
+        names = updated.map { it.name }
+        bitmaps = arrayOfNulls(updated.size)
+        selected = selected.coerceIn(0, maxOf(0, updated.lastIndex))
+        loadCategoryIcons()
+        postInvalidateOnAnimation()
+    }
+
+    fun reloadCategoryIcons() {
+        bitmaps = arrayOfNulls(categories.size)
+        loadCategoryIcons()
+        postInvalidateOnAnimation()
+    }
+
+    private fun loadCategoryIcons() {
+        categories.forEachIndexed { index, category ->
+            ChannelIconLoader.load(category.iconUrl, this) { bitmap ->
+                if (index < bitmaps.size) {
+                    bitmaps[index] = bitmap
+                    postInvalidateOnAnimation()
+                }
+            }
+        }
+    }
+
+    override fun onDraw(c: Canvas) {
+        c.drawColor(Color.rgb(32, 32, 32))
+        val side = dp(38f)
+        val gap = dp(16f)
+        val top = dp(95f)
+        val rowGap = dp(50f)
+        val cw = (width - side * 2 - gap * (columns - 1)) / columns.toFloat()
+        c.save()
+        c.clipRect(0f, 0f, width.toFloat(), height.toFloat())
+        c.translate(0f, -scrollOffset)
+        repeat(names.size) { i ->
+            val row = i / columns
+            val column = i % columns
+            val left = side + column * (cw + gap)
+            val topPos = top + row * (cw + rowGap)
+            val r = RectF(left, topPos, left + cw, topPos + cw)
+            iconPaint.style = Paint.Style.FILL
+            iconPaint.color = Color.rgb(96, 96, 96)
+            c.drawRoundRect(r, dp(24f), dp(24f), iconPaint)
+            val bitmap = bitmaps[i]
+            if (bitmap != null && !bitmap.isRecycled) {
+                val safe = RectF(r.left + dp(5f), r.top + dp(5f), r.right - dp(5f), r.bottom - dp(5f))
+                val scale = minOf(safe.width() / bitmap.width.toFloat(), safe.height() / bitmap.height.toFloat()) * 1.08f
+                val w = bitmap.width * scale
+                val h = bitmap.height * scale
+                val dst = RectF(safe.centerX() - w / 2, safe.centerY() - h / 2, safe.centerX() + w / 2, safe.centerY() + h / 2)
+                val clipPath = Path().apply { addRoundRect(r, dp(24f), dp(24f), Path.Direction.CW) }
+                c.save()
+                c.clipPath(clipPath)
+                c.drawBitmap(bitmap, null, dst, iconPaint)
+                c.restore()
+            }
+            if (i == selected) {
+                selectionPaint.strokeWidth = dp(3f)
+                c.drawRoundRect(RectF(r.left - dp(3f), r.top - dp(3f), r.right + dp(3f), r.bottom + dp(3f)), dp(27f), dp(27f), selectionPaint)
+            }
+            title.textAlign = Paint.Align.CENTER
+            title.textSize = dp(17f)
+            c.drawText(names[i], r.centerX(), r.bottom + dp(30f), title)
+        }
+        c.restore()
+    }
+
+    private fun ensureSelectedVisible() {
+        if (names.isEmpty() || width <= 0 || height <= 0) {
+            scrollOffset = 0f
+            return
+        }
+
+        val side = dp(38f)
+        val gap = dp(16f)
+        val contentTop = dp(95f)
+        val rowGap = dp(50f)
+        val cellWidth = (width - side * 2 - gap * (columns - 1)) / columns.toFloat()
+        val rowHeight = cellWidth + rowGap
+        val row = selected / columns
+
+        // Item bounds are in content coordinates. The viewport runs from contentTop
+        // to the actual bottom of the view; compare the translated bounds against it.
+        val selectedTop = contentTop + row * rowHeight
+        val selectedBottom = selectedTop + cellWidth + dp(30f)
+        val viewportBottom = height.toFloat()
+
+        if (selectedTop - scrollOffset < contentTop) {
+            scrollOffset = selectedTop - contentTop
+        } else if (selectedBottom - scrollOffset > viewportBottom) {
+            scrollOffset = selectedBottom - viewportBottom
+        }
+
+        val rowCount = (names.size + columns - 1) / columns
+        val contentBottom = contentTop + (rowCount - 1) * rowHeight + cellWidth + dp(30f)
+        val maxScroll = maxOf(0f, contentBottom - viewportBottom)
+        scrollOffset = scrollOffset.coerceIn(0f, maxScroll)
+    }
+
+    private fun scrollByPixels(delta: Float) {
+        if (delta == 0f) return
+        val side = dp(38f)
+        val gap = dp(16f)
+        val top = dp(95f)
+        val rowGap = dp(50f)
+        val cw = (width - side * 2 - gap * (columns - 1)) / columns.toFloat()
+        val rowHeight = cw + rowGap
+        val rowCount = (names.size + columns - 1) / columns
+        val contentBottom = top + rowCount * rowHeight - rowGap + dp(30f)
+        val maxScroll = maxOf(0f, contentBottom - height + dp(12f))
+        scrollOffset = (scrollOffset + delta).coerceIn(0f, maxScroll)
+        postInvalidateOnAnimation()
+    }
+
+    private fun moveSelection(newIndex: Int) {
+        if (newIndex in names.indices) {
+            selected = newIndex
+            ensureSelectedVisible()
+            postInvalidateOnAnimation()
+        }
+    }
+
+    private fun adjacentRowTarget(index: Int, itemCount: Int, columns: Int, direction: Int): Int? {
+        if (index !in 0 until itemCount || columns <= 0) return null
+        val currentRow = index / columns
+        val currentColumn = index % columns
+        val targetRow = currentRow + direction
+        if (targetRow < 0) return null
+        val targetStart = targetRow * columns
+        if (targetStart >= itemCount) return null
+        val targetEnd = minOf(itemCount - 1, targetStart + columns - 1)
+        return minOf(targetStart + currentColumn, targetEnd)
+    }
+
+    fun handleDpadKey(k: Int): Boolean {
+        when (k) {
+            KeyEvent.KEYCODE_DPAD_LEFT -> { if (selected > 0) moveSelection(selected - 1); return true }
+            KeyEvent.KEYCODE_DPAD_RIGHT -> { if (selected < names.lastIndex) moveSelection(selected + 1); return true }
+            KeyEvent.KEYCODE_DPAD_UP -> { adjacentRowTarget(selected, names.size, columns, -1)?.let { moveSelection(it) }; return true }
+            KeyEvent.KEYCODE_DPAD_DOWN -> { adjacentRowTarget(selected, names.size, columns, +1)?.let { moveSelection(it) }; return true }
+            KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER -> { (context as? MainActivity)?.openCategory(selected); return true }
+            KeyEvent.KEYCODE_BACK, KeyEvent.KEYCODE_ESCAPE -> {
+                val now = System.currentTimeMillis()
+                if (now - lastBackPressTime <= 2000L) (context as? Activity)?.finish() else { lastBackPressTime = now; Toast.makeText(context, "Press back again to exit", Toast.LENGTH_SHORT).show() }
+                return true
+            }
+        }
+        return false
+    }
+
+    override fun onTouchEvent(event: android.view.MotionEvent): Boolean {
+        when (event.actionMasked) {
+            android.view.MotionEvent.ACTION_DOWN -> {
+                lastTouchY = event.y
+                touchDragging = false
+                return true
+            }
+            android.view.MotionEvent.ACTION_MOVE -> {
+                val dy = lastTouchY - event.y
+                if (!touchDragging && kotlin.math.abs(dy) > dp(4f)) touchDragging = true
+                if (touchDragging) scrollByPixels(dy)
+                lastTouchY = event.y
+                return true
+            }
+            android.view.MotionEvent.ACTION_UP, android.view.MotionEvent.ACTION_CANCEL -> {
+                touchDragging = false
+                return true
+            }
+        }
+        return true
+    }
+
+    override fun onGenericMotionEvent(event: android.view.MotionEvent): Boolean {
+        if (event.action == android.view.MotionEvent.ACTION_SCROLL) {
+            scrollByPixels(-event.getAxisValue(android.view.MotionEvent.AXIS_VSCROLL) * dp(40f))
+            return true
+        }
+        return super.onGenericMotionEvent(event)
+    }
+
+    override fun onKeyDown(k: Int, e: KeyEvent): Boolean = if (handleDpadKey(k)) true else super.onKeyDown(k, e)
+    private fun dp(v: Float) = v * resources.displayMetrics.density
+}
+
+private class ChannelView(
+    context: Context,
+    initialChannels: List<Channel>
+) : View(context) {
+    private var channels: List<Channel> = initialChannels
+    private var bitmaps: Array<Bitmap?> = arrayOfNulls(initialChannels.size)
+
+
+    private val title = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.WHITE; typeface = Typeface.DEFAULT_BOLD }
+    private val iconPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { isFilterBitmap = true; isAntiAlias = true }
+    private val selectionPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE; color = Color.WHITE; isAntiAlias = true }
+
+    private val columns = 5
+    private var selected = 0
+    private var scrollOffset = 0f
+    private var lastTouchY = 0f
+    private var touchDragging = false
+
+    init {
+        isFocusable = true
+        isFocusableInTouchMode = true
+        requestFocus()
+        loadIcons()
+    }
+
+    fun replaceChannels(updated: List<Channel>) {
+        if (channels == updated) return
+        val orderChanged = channels.map { it.name.trim() } != updated.map { it.name.trim() }
+        channels = updated
+        bitmaps = arrayOfNulls(updated.size)
+        if (orderChanged) {
+            selected = 0
+            scrollOffset = 0f
+        } else {
+            selected = selected.coerceIn(0, maxOf(0, updated.lastIndex))
+        }
+        loadIcons()
+        postInvalidateOnAnimation()
+    }
+
+    fun currentChannels(): List<Channel> = channels
+
+    fun currentIconUrls(): List<String> = channels.map { it.iconUrl }
+
+    fun reloadChannelIcons() {
+        bitmaps = arrayOfNulls(channels.size)
+        loadIcons()
+        postInvalidateOnAnimation()
+    }
+
+    private fun loadIcons() {
+        for (i in channels.indices) {
+            val index = i
+            ChannelIconLoader.load(channels[index].iconUrl, this) { bitmap ->
+                if (index < bitmaps.size) {
+                    bitmaps[index] = bitmap
+                    postInvalidateOnAnimation()
+                }
+            }
+        }
+    }
+
+    override fun onDraw(c: Canvas) {
+        c.drawColor(Color.rgb(32, 32, 32))
+
+        val side = dp(38f)
+        val gap = dp(16f)
+        val top = dp(70f)
+        val rowGap = dp(50f)
+        val cw = (width - side * 2 - gap * (columns - 1)) / columns.toFloat()
+        val cardHeight = cw * 288f / 376f
+        val rowHeight = cardHeight + rowGap
+        val rowCount = (channels.size + columns - 1) / columns
+        val contentBottom = top + rowCount * rowHeight - rowGap + dp(26f)
+        val maxScroll = maxOf(0f, contentBottom - height + dp(12f))
+        scrollOffset = scrollOffset.coerceIn(0f, maxScroll)
+
+        c.save()
+        c.clipRect(0f, 0f, width.toFloat(), height.toFloat())
+        c.translate(0f, -scrollOffset)
+
+        if (rowCount > 0) {
+            val firstRow = maxOf(0, ((scrollOffset - top) / rowHeight).toInt() - 1)
+            val lastRow = minOf(rowCount - 1, ((scrollOffset + height - top) / rowHeight).toInt() + 1)
+
+            for (row in firstRow..lastRow) {
+                val start = row * columns
+                val end = minOf(channels.size, start + columns)
+                for (i in start until end) {
+                    val column = i % columns
+                    val left = side + column * (cw + gap)
+                    val topPos = top + row * rowHeight
+                    val r = RectF(left, topPos, left + cw, topPos + cardHeight)
+
+                    iconPaint.style = Paint.Style.FILL
+                    iconPaint.color = Color.rgb(96, 96, 96)
+                    c.drawRoundRect(r, dp(24f), dp(24f), iconPaint)
+
+                    val bitmap = bitmaps[i]
+                    if (bitmap != null && !bitmap.isRecycled) {
+                        val safe = RectF(r.left + dp(5f), r.top + dp(5f), r.right - dp(5f), r.bottom - dp(5f))
+                        val scale = minOf(
+                            safe.width() / bitmap.width.toFloat(),
+                            safe.height() / bitmap.height.toFloat()
+                        )
+                        val targetWidth = bitmap.width * scale
+                        val targetHeight = bitmap.height * scale
+                        val dst = RectF(
+                            safe.centerX() - targetWidth / 2,
+                            safe.centerY() - targetHeight / 2,
+                            safe.centerX() + targetWidth / 2,
+                            safe.centerY() + targetHeight / 2
+                        )
+                        c.save()
+                        c.clipPath(Path().apply { addRoundRect(r, dp(24f), dp(24f), Path.Direction.CW) })
+                        c.drawBitmap(bitmap, null, dst, iconPaint)
+                        c.restore()
+                    }
+
+                    if (i == selected) {
+                        selectionPaint.strokeWidth = dp(3f)
+                        c.drawRoundRect(RectF(r.left - dp(3f), r.top - dp(3f), r.right + dp(3f), r.bottom + dp(3f)), dp(27f), dp(27f), selectionPaint)
+                    }
+
+                    title.textAlign = Paint.Align.CENTER
+                    title.textSize = dp(15f)
+                    c.drawText(channels[i].name, r.centerX(), r.bottom + dp(26f), title)
+                }
+            }
+        }
+        c.restore()
+    }
+
+    private fun adjacentRowTarget(index: Int, itemCount: Int, columns: Int, direction: Int): Int? {
+        if (index !in 0 until itemCount || columns <= 0) return null
+        val currentRow = index / columns
+        val currentColumn = index % columns
+        val targetRow = currentRow + direction
+        if (targetRow < 0) return null
+        val targetStart = targetRow * columns
+        if (targetStart >= itemCount) return null
+        val targetEnd = minOf(itemCount - 1, targetStart + columns - 1)
+        return minOf(targetStart + currentColumn, targetEnd)
+    }
+
+    private fun ensureSelectedVisible() {
+        if (channels.isEmpty() || width <= 0 || height <= 0) {
+            scrollOffset = 0f
+            return
+        }
+
+        val side = dp(38f)
+        val gap = dp(16f)
+        val contentTop = dp(70f)
+        val rowGap = dp(50f)
+        val cellWidth = (width - side * 2 - gap * (columns - 1)) / columns.toFloat()
+        val cardHeight = cellWidth * 288f / 376f
+        val rowHeight = cardHeight + rowGap
+        val row = selected / columns
+        val selectedTop = contentTop + row * rowHeight
+        // Include the focus outline and channel label in the visible item bounds.
+        val selectedBottom = selectedTop + cardHeight + dp(29f)
+
+        if (selectedTop - scrollOffset < contentTop) {
+            scrollOffset = selectedTop - contentTop
+        } else if (selectedBottom - scrollOffset > height.toFloat()) {
+            scrollOffset = selectedBottom - height.toFloat()
+        }
+
+        val rowCount = (channels.size + columns - 1) / columns
+        val contentBottom = contentTop + (rowCount - 1) * rowHeight + cardHeight + dp(29f)
+        val maxScroll = maxOf(0f, contentBottom - height.toFloat())
+        scrollOffset = scrollOffset.coerceIn(0f, maxScroll)
+    }
+
+    private fun moveSelection(newIndex: Int) {
+        if (newIndex in channels.indices) {
+            selected = newIndex
+            ensureSelectedVisible()
+            postInvalidateOnAnimation()
+        }
+    }
+
+    private fun scrollByPixels(delta: Float) {
+        if (delta == 0f) return
+        scrollOffset += delta
+        val side = dp(38f)
+        val gap = dp(16f)
+        val top = dp(70f)
+        val rowGap = dp(50f)
+        val cw = (width - side * 2 - gap * (columns - 1)) / columns.toFloat()
+        val cardHeight = cw * 288f / 376f
+        val rowHeight = cardHeight + rowGap
+        val rowCount = (channels.size + columns - 1) / columns
+        val contentBottom = top + rowCount * rowHeight - rowGap + dp(26f)
+        val maxScroll = maxOf(0f, contentBottom - height + dp(12f))
+        scrollOffset = scrollOffset.coerceIn(0f, maxScroll)
+        postInvalidateOnAnimation()
+    }
+
+    fun handleDpadKey(k: Int): Boolean {
+        when (k) {
+            KeyEvent.KEYCODE_DPAD_LEFT -> {
+                if (selected > 0) moveSelection(selected - 1)
+                return true
+            }
+            KeyEvent.KEYCODE_DPAD_RIGHT -> {
+                if (selected < channels.lastIndex) moveSelection(selected + 1)
+                return true
+            }
+            KeyEvent.KEYCODE_DPAD_UP -> {
+                adjacentRowTarget(selected, channels.size, columns, -1)?.let { moveSelection(it) }
+                return true
+            }
+            KeyEvent.KEYCODE_DPAD_DOWN -> {
+                adjacentRowTarget(selected, channels.size, columns, +1)?.let { moveSelection(it) }
+                return true
+            }
+            KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER -> {
+                if (channels.isNotEmpty()) (context as? MainActivity)?.openStream(channels[selected].streamUrl)
+                return true
+            }
+            KeyEvent.KEYCODE_BACK, KeyEvent.KEYCODE_ESCAPE -> {
+                (context as? MainActivity)?.showHome()
+                return true
+            }
+        }
+        return false
+    }
+
+    override fun onTouchEvent(event: android.view.MotionEvent): Boolean {
+        when (event.actionMasked) {
+            android.view.MotionEvent.ACTION_DOWN -> {
+                lastTouchY = event.y
+                touchDragging = false
+                return true
+            }
+            android.view.MotionEvent.ACTION_MOVE -> {
+                val dy = lastTouchY - event.y
+                if (!touchDragging && kotlin.math.abs(dy) > dp(4f)) touchDragging = true
+                if (touchDragging) scrollByPixels(dy)
+                lastTouchY = event.y
+                return true
+            }
+            android.view.MotionEvent.ACTION_UP, android.view.MotionEvent.ACTION_CANCEL -> {
+                touchDragging = false
+                return true
+            }
+        }
+        return true
+    }
+
+    override fun onGenericMotionEvent(event: android.view.MotionEvent): Boolean {
+        if (event.action == android.view.MotionEvent.ACTION_SCROLL) {
+            scrollByPixels(-event.getAxisValue(android.view.MotionEvent.AXIS_VSCROLL) * dp(40f))
+            return true
+        }
+        return super.onGenericMotionEvent(event)
+    }
+
+    private fun dp(v: Float) = v * resources.displayMetrics.density
+}
+
+// ---- Inlined from Channel.kt ----
+data class Channel(
+    val name: String,
+    val streamUrl: String,
+    val iconUrl: String
+)
+
+// ---- Inlined from RemoteChannelRepository.kt ----
+
+internal data class Category(
+    val name: String,
+    val iconUrl: String,
+    val channelsUrl: String
+)
+
+/**
+ * Loads Categories/categories.txt and each category's channel file URL.
+ * Catalog text files stay in the repository instead of being bundled in the APK.
+ */
+internal data class CatalogUpdate(
+    val categories: List<Category>,
+    val categoriesChanged: Boolean,
+    val changedCategoryNames: Set<String>
+)
+
+internal object RemoteChannelRepository {
+    private const val CATEGORIES_URL =
+        "https://raw.githubusercontent.com/vinod-rajput-vg/My-India-TV/main/Categories/categories.txt"
+
+    // Keep interactive catalog requests isolated from the startup fingerprint scan.
+    private val catalogExecutor = Executors.newFixedThreadPool(2)
+    private val scanExecutor = Executors.newSingleThreadExecutor()
+    private val mainHandler = Handler(Looper.getMainLooper())
+    fun loadCategories(context: Context, callback: (List<Category>) -> Unit) {
+        catalogExecutor.execute {
+            val categories = runCatching {
+                val catalogText = fetchText(CATEGORIES_URL)
+                parseCategories(catalogText)
+            }.getOrDefault(emptyList())
+
+            mainHandler.post { callback(categories) }
+        }
+    }
+
+    fun loadChannels(context: Context, category: Category, callback: (List<Channel>) -> Unit) {
+        catalogExecutor.execute {
+            val channels = runCatching {
+                val content = fetchText(category.channelsUrl)
+                parseChannelText(content)
+            }.getOrDefault(emptyList())
+
+            mainHandler.post { callback(channels) }
+        }
+    }
+
+    /**
+     * Compare the remote catalog with the last successful scan persisted across app launches.
+     * Failed channel fetches keep their previous fingerprints so the next startup can retry.
+     * Changes are delivered as a batch, and only changed categories are refreshed.
+     */
+    fun scanForChanges(context: Context, callback: (CatalogUpdate?) -> Unit) {
+        scanExecutor.execute {
+            val result = runCatching {
+                val catalogText = fetchText(CATEGORIES_URL)
+                val currentCategories = parseCategories(catalogText)
+                val currentCatalogHash = sha256(catalogText)
+                val preferences = context.applicationContext.getSharedPreferences(
+                    "remote_catalog_snapshots",
+                    Context.MODE_PRIVATE
+                )
+                val previousCatalogHash = preferences.getString("categories_sha256", null)
+                val categoriesChanged = previousCatalogHash != null &&
+                    previousCatalogHash != currentCatalogHash
+
+                val changed = linkedSetOf<String>()
+                val successfulChannelHashes = linkedMapOf<String, String>()
+                currentCategories.forEach { category ->
+                    val key = category.name.lowercase()
+                    val content = runCatching { fetchText(category.channelsUrl) }.getOrNull()
+                        ?: return@forEach
+                    val hash = sha256(content)
+                    val previous = preferences.getString("channel_$key", null)
+                    if (previous != null && previous != hash) changed.add(category.name)
+                    successfulChannelHashes[key] = hash
+                }
+
+                val editor = preferences.edit()
+                    .putString("categories_sha256", currentCatalogHash)
+                successfulChannelHashes.forEach { (key, hash) ->
+                    editor.putString("channel_$key", hash)
+                }
+                val currentKeys = currentCategories.map { "channel_${it.name.lowercase()}" }.toSet()
+                preferences.all.keys
+                    .filter { it.startsWith("channel_") && it !in currentKeys }
+                    .forEach(editor::remove)
+                editor.apply()
+
+                CatalogUpdate(currentCategories, categoriesChanged, changed)
+            }.getOrNull()
+
+            mainHandler.post { callback(result) }
+        }
+    }
+
+    private fun parseCategories(text: String): List<Category> {
+        val lines = text.lines()
+        val result = mutableListOf<Category>()
+        var index = 0
+        while (index < lines.size) {
+            val name = lines[index].trim()
+            if (name.isEmpty()) {
+                index++
+                continue
+            }
+            val iconUrl = lines.getOrNull(index + 1)?.trim().orEmpty()
+            val channelsUrl = lines.getOrNull(index + 2)?.trim().orEmpty()
+            if (iconUrl.startsWith("https://") &&
+                (channelsUrl.startsWith("https://") || channelsUrl.startsWith("http://"))
+            ) {
+                result += Category(name, iconUrl, channelsUrl)
+                index += 3
+            } else {
+                index++
+            }
+        }
+        return result
+    }
+
+    private fun sha256(value: String): String {
+        val digest = java.security.MessageDigest.getInstance("SHA-256")
+        return digest.digest(value.toByteArray(Charsets.UTF_8))
+            .joinToString("") { "%02x".format(it) }
+    }
+
+    private fun fetchText(source: String): String {
+        var connection: HttpURLConnection? = null
+        try {
+            connection = URL(source).openConnection() as HttpURLConnection
+            connection.connectTimeout = 12_000
+            connection.readTimeout = 20_000
+            connection.instanceFollowRedirects = true
+            connection.setRequestProperty("User-Agent", "My-India-TV/1.0")
+            connection.connect()
+            if (connection.responseCode !in 200..299) {
+                throw IllegalStateException("HTTP ${connection.responseCode} loading catalog")
+            }
+            return connection.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+        } finally {
+            connection?.disconnect()
+        }
+    }
+
+    /** Each repository record has channel name, icon URL, and stream URL on separate lines. */
+    private fun parseChannelText(text: String): List<Channel> {
+        val lines = text.lines()
+        if (lines.any { it.trim().startsWith("#EXTINF:", ignoreCase = true) }) {
+            val result = mutableListOf<Channel>()
+            var name: String? = null
+            var iconUrl = ""
+
+            for (rawLine in lines) {
+                val line = rawLine.trim()
+                if (line.isEmpty() || line.equals("#EXTM3U", ignoreCase = true)) continue
+
+                if (line.startsWith("#EXTINF:", ignoreCase = true)) {
+                    val comma = line.indexOf(',')
+                    if (comma < 0) continue
+                    val attributes = line.substring(0, comma)
+                    name = line.substring(comma + 1).trim()
+                    iconUrl = Regex("""tvg-logo="([^"]*)"""", RegexOption.IGNORE_CASE)
+                        .find(attributes)?.groupValues?.getOrNull(1).orEmpty()
+                } else if (!line.startsWith("#") && !name.isNullOrBlank()) {
+                    result += Channel(name = name, streamUrl = line, iconUrl = iconUrl)
+                    name = null
+                    iconUrl = ""
+                }
+            }
+            return result
+        }
+
+        val records = lines.map { it.trim() }
+            .filter { it.isNotEmpty() && !it.startsWith("#") }
+
+        return records
+            .chunked(3)
+            .filter { it.size == 3 && it[0].isNotBlank() && it[2].isNotBlank() }
+            .map { Channel(name = it[0], iconUrl = it[1], streamUrl = it[2]) }
+    }
+}
