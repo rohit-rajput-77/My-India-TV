@@ -2,6 +2,10 @@ Entertainment
 https://raw.githubusercontent.com/vinod-rajput-vg/My-India-TV/main/Category%20Icons/entertainment.png
 https://raw.githubusercontent.com/vinod-rajput-vg/IPTV-Automation/refs/heads/main/Output/entertainment.txt
 
+Drama
+https://raw.githubusercontent.com/vinod-rajput-vg/My-India-TV/main/Category%20Icons/drama.png
+https://raw.githubusercontent.com/vinod-rajput-vg/IPTV-Automation/refs/heads/main/Output/drama.txt
+
 Infotainment
 https://raw.githubusercontent.com/vinod-rajput-vg/My-India-TV/main/Category%20Icons/infotainment.png
 https://raw.githubusercontent.com/vinod-rajput-vg/IPTV-Automation/refs/heads/main/Output/infotainment.txt
@@ -9,7 +13,3 @@ https://raw.githubusercontent.com/vinod-rajput-vg/IPTV-Automation/refs/heads/mai
 News
 https://raw.githubusercontent.com/vinod-rajput-vg/My-India-TV/main/Category%20Icons/news.png
 https://raw.githubusercontent.com/vinod-rajput-vg/My-India-TV/main/Category%20Channels/news.txt
-
-Drama
-https://raw.githubusercontent.com/vinod-rajput-vg/My-India-TV/main/Category%20Icons/drama.png
-https://raw.githubusercontent.com/vinod-rajput-vg/IPTV-Automation/refs/heads/main/Output/drama.txt
